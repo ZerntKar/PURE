@@ -29,7 +29,7 @@ PURE/
 │
 ├── evaluation/
 │   └── metrics.py             # PUREEvaluator, P-EHR, F-EHR, BLEU-4, ROUGE-L, FMR, FCR, DIV
-│
+│   └── feature_extractor.py
 └── data/
     ├── movies/
     │   ├── kg_triples.json
