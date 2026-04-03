@@ -10,36 +10,6 @@
 
 ---
 
-## 📖 Overview
-
-Given a user's interaction history and a target item, PURE explains *why* the item is recommended by reasoning over a knowledge graph and generating a natural-language explanation grounded in the user's actual preferences.
-
-```
-User History ──► Multi-hop KG Path Retrieval (RGAT)
-                        │
-                        ▼
-              Node Specificity Scoring (λ_s · λ_m · λ_p)
-                        │
-                        ▼
-         Graph-Transformer Cross-Attention Projector
-                        │
-                        ▼
-          LoRA-fine-tuned LLM ──► Natural Language Explanation
-```
-
----
-
-## ✨ Key Features
-
-- 🧠 **Relation-aware RGAT encoder** — heterogeneous KG message passing with per-edge relation matrices and multi-head attention
-- 🛤️ **MMR path retrieval** — diversity-aware top-k path selection balancing relevance and coverage (γ = 0.6)
-- 📐 **Node specificity scorer** — jointly models semantic rarity (λ_s), membership signal (λ_m), and structural position (λ_p)
-- 🔗 **Graph-Transformer projector** — soft-prompt injection bridging KG subgraph embeddings into LLM token space
-- ⚡ **Efficient inference** — AMP mixed-precision + LoRA, < 200 ms per explanation on a single A100
-- 📊 **Faithfulness-first evaluation** — P-EHR and F-EHR metrics explicitly penalize preference-misaligned hallucination
-
----
-
 ## 🗂️ Repository Structure
 
 ```
@@ -84,12 +54,6 @@ pip install transformers>=4.40
 pip install peft>=0.10
 pip install sentence-transformers>=2.7
 pip install rouge-score nltk numpy tqdm
-```
-
-Or install all at once:
-
-```bash
-pip install -r requirements.txt
 ```
 
 ---
