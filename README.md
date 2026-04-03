@@ -10,7 +10,7 @@
 
 ---
 
-## 🗂️ Repository Structure
+## Repository Structure
 
 ```
 PURE/
@@ -45,7 +45,7 @@ PURE/
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 ```bash
 pip install torch>=2.1 torchvision
@@ -59,7 +59,7 @@ pip install rouge-score nltk numpy tqdm
 ---
 
 
-## 📊 Evaluation Metrics
+## Evaluation Metrics
 
 | Metric | Description | Direction |
 |--------|-------------|-----------|
