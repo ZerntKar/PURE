@@ -1,4 +1,4 @@
-# PURE 🔍
+# PURE 
 ### Path-aware User preference Reasoning for Explainable Recommendation
 
 > Knowledge-graph-grounded explainable recommendation via RGAT path retrieval and LoRA-fine-tuned LLM generation.
