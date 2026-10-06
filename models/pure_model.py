@@ -3,7 +3,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import (
+    LoraConfig, PeftModel, TaskType, get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -45,11 +48,14 @@ class PUREModel(nn.Module):
         kg,
         node_embeddings: torch.Tensor,
         specificity_scorer,
-        path_encoder,
+        path_index,
+        adapter_path: Optional[str] = None,
+        adapter_trainable: bool = False,
     ):
         super().__init__()
         self.config = config
         self.kg = kg
+        self.path_index = path_index
 
         self.register_buffer("node_embeddings", node_embeddings)
 
@@ -67,17 +73,22 @@ class PUREModel(nn.Module):
             n_soft_tokens=config.n_soft_tokens,
         )
 
+        self.sent_encoder = SentenceTransformer(
+            "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.sent_encoder.requires_grad_(False)
         self.align_projector = AlignmentProjector(
             graph_dim=config.gt_hidden,
-            align_dim=config.gt_hidden,
+            align_dim=self.sent_encoder.get_sentence_embedding_dimension(),
         )
 
         self.path_retrieval = PreferenceAwarePathRetrieval(
             embed_dim=node_embeddings.shape[-1],
             specificity_scorer=specificity_scorer,
-            path_encoder=path_encoder,
             top_n=config.top_n_paths,
             mmr_gamma=config.mmr_gamma,
+            candidate_pool=config.candidate_pool,
+            score_threshold=config.path_score_threshold,
         )
 
         self.llm_tokenizer = AutoTokenizer.from_pretrained(config.llm_name)
@@ -90,6 +101,7 @@ class PUREModel(nn.Module):
             torch_dtype=torch.float16,
             device_map="auto",
         )
+        base_llm = prepare_model_for_kbit_training(base_llm)
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_r,
@@ -97,15 +109,29 @@ class PUREModel(nn.Module):
             lora_dropout=config.lora_dropout,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         )
-        self.llm = get_peft_model(base_llm, lora_cfg)
+        self.llm = (
+            PeftModel.from_pretrained(
+                base_llm, adapter_path, is_trainable=adapter_trainable,
+            )
+            if adapter_path else get_peft_model(base_llm, lora_cfg)
+        )
 
         self.lambda_align = config.lambda_align
 
-        self.sent_encoder = SentenceTransformer(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        )
-        for p in self.sent_encoder.parameters():
-            p.requires_grad = False
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The alignment target is supplied by a frozen sentence encoder.
+        self.sent_encoder.eval()
+        return self
+
+    def move_graph_modules(self, device):
+        """Keep the 8-bit device-mapped LLM in place while moving graph modules."""
+        self.node_embeddings = self.node_embeddings.to(device)
+        self.graph_transformer.to(device)
+        self.projector.to(device)
+        self.align_projector.to(device)
+        self.path_retrieval.to(device)
+        return self
 
     @property
     def device(self) -> torch.device:
@@ -114,6 +140,7 @@ class PUREModel(nn.Module):
     def encode_subgraph(
         self,
         selected_paths: List[List[Tuple[int, int, int]]],
+        user_intent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not selected_paths:
             return self.node_embeddings.new_zeros(1, self.config.gt_hidden)
@@ -129,6 +156,11 @@ class PUREModel(nn.Module):
         node_list = sorted(nodes)
         node2idx  = {n: i for i, n in enumerate(node_list)}
         x         = self.node_embeddings[node_list]
+        if user_intent is not None:
+            preference = 0.5 * (
+                1.0 + F.cosine_similarity(x, user_intent.unsqueeze(0), dim=-1)
+            )
+            x = x * preference.unsqueeze(-1)
 
         if edges:
             src        = torch.tensor([node2idx[h] for h, r, t in edges], device=self.device)
@@ -146,6 +178,7 @@ class PUREModel(nn.Module):
     def encode_subgraph_batch(
         self,
         paths_batch: List[List[List[Tuple[int, int, int]]]],
+        intents: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         all_x:          List[torch.Tensor] = []
         all_edge_index: List[torch.Tensor] = []
@@ -171,7 +204,17 @@ class PUREModel(nn.Module):
             node_list = sorted(nodes)
             node2idx  = {n: i + node_offset for i, n in enumerate(node_list)}
 
-            all_x.append(self.node_embeddings[node_list])
+            node_features = self.node_embeddings[node_list]
+            if intents is not None:
+                # Differentiable preference weighting lets the paper's two
+                # losses train the target-aware attention projection.
+                preference = 0.5 * (
+                    1.0 + F.cosine_similarity(
+                        node_features, intents[batch_idx].unsqueeze(0), dim=-1,
+                    )
+                )
+                node_features = node_features * preference.unsqueeze(-1)
+            all_x.append(node_features)
             all_batch.append(
                 torch.full((len(node_list),), batch_idx, dtype=torch.long, device=self.device)
             )
@@ -211,7 +254,7 @@ class PUREModel(nn.Module):
             "Generate a personalized explanation for why the user would enjoy the recommended item. "
             "Focus on aspects that align with the user's demonstrated preferences."
         )
-        history_str  = "User's watched history: " + ", ".join(
+        history_str  = "User interaction history: " + ", ".join(
             history_texts[-self.config.history_len:]
         )
         path_strs = []
@@ -232,8 +275,8 @@ class PUREModel(nn.Module):
         return (
             f"{sys_instruction}\n\n"
             f"{history_str}\n\n"
-            f"{paths_section}\n\n"
             f"{target_section}\n\n"
+            f"{paths_section}\n\n"
             f"Explanation:"
         )
 
@@ -244,34 +287,33 @@ class PUREModel(nn.Module):
         adj: Dict[int, List[int]],
         id2entity: Dict[int, str],
         id2relation: Dict[int, str],
-        candidate_paths_batch: List[List[List[Tuple[int, int, int]]]],
     ) -> Dict[str, torch.Tensor]:
         B = len(batch["target_items"])
 
         all_selected_paths: List[List[List[Tuple[int, int, int]]]] = []
         all_hard_prompts:   List[str] = []
-        all_full_texts:     List[str] = []
+        all_intents:        List[torch.Tensor] = []
 
         for i in range(B):
             target_item      = batch["target_items"][i]
             history          = batch["histories"][i]
             explanation_text = batch["explanation_texts"][i]
-            candidate_paths  = candidate_paths_batch[i]
 
             target_emb   = self.node_embeddings[target_item]
             history_embs = self.node_embeddings[history]
 
-            selected_paths = self.path_retrieval.retrieve(
+            selected_paths, user_intent = self.path_retrieval.retrieve(
                 target_emb=target_emb,
                 history_embs=history_embs,
-                candidate_paths=candidate_paths,
+                target_item=target_item,
+                history=history,
+                path_index=self.path_index,
                 node_embeddings=self.node_embeddings,
                 node_degrees=node_degrees,
                 adj=adj,
-                id2entity=id2entity,
-                id2relation=id2relation,
             )
             all_selected_paths.append(selected_paths)
+            all_intents.append(user_intent)
 
             history_texts = [id2entity.get(h, str(h)) for h in history]
             target_text   = id2entity.get(target_item, str(target_item))
@@ -279,41 +321,48 @@ class PUREModel(nn.Module):
                 history_texts, target_text, selected_paths, id2entity, id2relation
             )
             all_hard_prompts.append(hard_prompt)
-            all_full_texts.append(hard_prompt + " " + explanation_text)
 
-        h_graphs     = self.encode_subgraph_batch(all_selected_paths)
+        h_graphs     = self.encode_subgraph_batch(all_selected_paths, all_intents)
         soft_prompts = self.projector(h_graphs)
 
-        enc = self.llm_tokenizer(
-            all_full_texts,
-            return_tensors="pt",
-            max_length=512,
-            truncation=True,
-            padding=True,
-        ).to(self.device)
+        # Tokenize the prompt and supervised continuation separately. Counting
+        # tokens in the prompt alone and then re-tokenizing their concatenated
+        # text can move the BPE boundary, supervising a prompt token by mistake.
+        sequences = []
+        label_sequences = []
+        for prompt, explanation in zip(all_hard_prompts, batch["explanation_texts"]):
+            prompt_ids = self.llm_tokenizer(
+                prompt, add_special_tokens=True,
+            )["input_ids"]
+            answer_ids = self.llm_tokenizer(
+                " " + explanation, add_special_tokens=False, truncation=True,
+                max_length=128,
+            )["input_ids"]
+            answer_ids.append(self.llm_tokenizer.eos_token_id)
+            sequences.append(prompt_ids + answer_ids)
+            label_sequences.append([-100] * len(prompt_ids) + answer_ids)
 
-        input_ids      = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
+        max_length = max(map(len, sequences))
+        pad_id = self.llm_tokenizer.pad_token_id
+        input_ids = torch.tensor([
+            row + [pad_id] * (max_length - len(row)) for row in sequences
+        ], dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor([
+            [1] * len(row) + [0] * (max_length - len(row))
+            for row in sequences
+        ], dtype=torch.long, device=self.device)
+        labels = torch.tensor([
+            row + [-100] * (max_length - len(row))
+            for row in label_sequences
+        ], dtype=torch.long, device=self.device)
 
         token_embs    = self.llm.get_input_embeddings()(input_ids)
-        combined_embs = torch.cat([soft_prompts, token_embs], dim=1)
-        soft_mask     = torch.ones(B, self.config.n_soft_tokens, device=self.device)
+        combined_embs = torch.cat([soft_prompts.to(token_embs), token_embs], dim=1)
+        soft_mask     = torch.ones(B, self.config.n_soft_tokens, device=token_embs.device)
         combined_mask = torch.cat([soft_mask, attention_mask], dim=1)
 
-        labels = input_ids.clone()
-        for i in range(B):
-            prompt_only_ids = self.llm_tokenizer(
-                all_hard_prompts[i],
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )["input_ids"]
-            prompt_len = min(prompt_only_ids.shape[1], input_ids.shape[1])
-            labels[i, :prompt_len]               = -100
-            labels[i, attention_mask[i] == 0]    = -100
-
         soft_labels     = torch.full(
-            (B, self.config.n_soft_tokens), -100, dtype=torch.long, device=self.device
+            (B, self.config.n_soft_tokens), -100, dtype=torch.long, device=input_ids.device
         )
         combined_labels = torch.cat([soft_labels, labels], dim=1)
 
@@ -332,7 +381,7 @@ class PUREModel(nn.Module):
 
         h_g_proj   = self.align_projector(h_graphs)
         h_y_normed = F.normalize(h_y, dim=-1)
-        h_g_normed = F.normalize(h_g_proj, dim=-1)
+        h_g_normed = F.normalize(h_g_proj.float(), dim=-1)
 
         loss_align = (1.0 - (h_g_normed * h_y_normed).sum(dim=-1)).mean()
         loss       = loss_gen + self.lambda_align * loss_align
@@ -344,6 +393,24 @@ class PUREModel(nn.Module):
         }
 
     @torch.no_grad()
+    def rank_candidates(
+        self, history: List[int], candidates: List[int],
+        node_degrees, adj,
+    ) -> List[int]:
+        history_embs = self.node_embeddings[history]
+        scored = [
+            (
+                item,
+                self.path_retrieval.score_item(
+                    self.node_embeddings[item], history_embs, item, history,
+                    self.path_index, self.node_embeddings, node_degrees, adj,
+                ),
+            )
+            for item in candidates
+        ]
+        return [item for item, _ in sorted(scored, key=lambda pair: pair[1], reverse=True)]
+
+    @torch.no_grad()
     def generate(
         self,
         target_item: int,
@@ -352,18 +419,18 @@ class PUREModel(nn.Module):
         adj: Dict[int, List[int]],
         id2entity: Dict[int, str],
         id2relation: Dict[int, str],
-        candidate_paths: List[List[Tuple[int, int, int]]],
         max_new_tokens: int = 128,
     ) -> str:
         target_emb   = self.node_embeddings[target_item]
         history_embs = self.node_embeddings[history]
 
-        selected_paths = self.path_retrieval.retrieve(
-            target_emb, history_embs, candidate_paths,
-            self.node_embeddings, node_degrees, adj, id2entity, id2relation,
+        selected_paths, user_intent = self.path_retrieval.retrieve(
+            target_emb=target_emb, history_embs=history_embs,
+            target_item=target_item, history=history, path_index=self.path_index,
+            node_embeddings=self.node_embeddings, node_degrees=node_degrees, adj=adj,
         )
 
-        h_graph      = self.encode_subgraph(selected_paths)
+        h_graph      = self.encode_subgraph(selected_paths, user_intent)
         soft_prompts = self.projector(h_graph)
 
         history_texts = [id2entity.get(h, str(h)) for h in history]
@@ -373,20 +440,21 @@ class PUREModel(nn.Module):
         )
 
         enc = self.llm_tokenizer(
-            hard_prompt, return_tensors="pt", max_length=384, truncation=True
+            hard_prompt, return_tensors="pt"
         ).to(self.device)
 
         token_embs    = self.llm.get_input_embeddings()(enc["input_ids"])
-        combined_embs = torch.cat([soft_prompts, token_embs], dim=1)
-        soft_mask     = torch.ones(1, self.config.n_soft_tokens, device=self.device)
+        combined_embs = torch.cat([soft_prompts.to(token_embs), token_embs], dim=1)
+        soft_mask     = torch.ones(1, self.config.n_soft_tokens, device=token_embs.device)
         combined_mask = torch.cat([soft_mask, enc["attention_mask"]], dim=1)
 
         generated  = self.llm.generate(
+            input_ids=enc["input_ids"],
             inputs_embeds=combined_embs,
             attention_mask=combined_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=self.llm_tokenizer.eos_token_id,
         )
-        output_ids = generated[0][combined_embs.shape[1]:]
+        output_ids = generated[0, enc["input_ids"].shape[1]:]
         return self.llm_tokenizer.decode(output_ids, skip_special_tokens=True)

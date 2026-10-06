@@ -31,7 +31,7 @@ class GraphTransformerLayer(nn.Module):
             nn.Linear(out_channels * 4, out_channels),
         )
         self.dropout = nn.Dropout(dropout)
-        self.rel_emb = nn.Embedding(num_relations + 1, edge_dim, padding_idx=0)
+        self.rel_emb = nn.Embedding(num_relations, edge_dim)
 
     def forward(
         self,

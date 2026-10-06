@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -12,18 +12,14 @@ from tqdm import tqdm
 
 from config import PUREConfig
 from data.dataset import KnowledgeGraph, RecommendationDataset, collate_fn
-from evaluation.metrics import (
-    PUREEvaluator,
-    SimpleFeatureExtractor,
-    compute_p_ehr,
-)
-from models.path_retrieval import PathEncoder
+from evaluation.metrics import PUREEvaluator
+from models.path_retrieval import PathIndex
 from models.pure_model import PUREModel
 from models.semantic_index import NodeSpecificityScorer
 from train import (
-    build_candidate_paths,
     build_edge_tensors,
     build_or_load_index,
+    build_or_load_path_index,
     load_data,
     set_seed,
 )
@@ -45,26 +41,32 @@ def load_pure_model(
     kg: KnowledgeGraph,
     node_embeddings: torch.Tensor,
     specificity_scorer: NodeSpecificityScorer,
-    path_encoder: PathEncoder,
+    path_index: PathIndex,
 ) -> PUREModel:
     logger.info(f"Loading PURE model from: {checkpoint_path}")
     ckpt_dir = Path(checkpoint_path).parent
-
+    ckpt = torch.load(
+        checkpoint_path, map_location=config.device, weights_only=True,
+    )
+    lora_path = (
+        ckpt_dir / "best_lora"
+        if Path(checkpoint_path).stem == "best_model"
+        else ckpt_dir / f"lora_epoch{ckpt['epoch'] + 1}"
+    )
+    if not lora_path.exists():
+        raise FileNotFoundError(f"Fine-tuned LoRA adapter is required: {lora_path}")
     model = PUREModel(
         config=config,
         kg=kg,
         node_embeddings=node_embeddings,
         specificity_scorer=specificity_scorer,
-        path_encoder=path_encoder,
+        path_index=path_index,
+        adapter_path=str(lora_path),
     )
 
-    ckpt = torch.load(
-        checkpoint_path,
-        map_location=config.device,
-        weights_only=True,
-    )
     model.graph_transformer.load_state_dict(ckpt["graph_transformer"])
     model.projector.load_state_dict(ckpt["projector"])
+    model.align_projector.load_state_dict(ckpt["align_projector"])
     model.path_retrieval.load_state_dict(ckpt["path_retrieval"])
     logger.info(
         f"Graph modules loaded — "
@@ -72,22 +74,7 @@ def load_pure_model(
         f"step: {ckpt.get('global_step', 'N/A')}"
     )
 
-    lora_path = ckpt_dir / "best_lora"
-    if lora_path.exists():
-        from peft import PeftModel
-        model.llm = PeftModel.from_pretrained(
-            model.llm,
-            str(lora_path),
-            is_trainable=False,
-        )
-        logger.info(f"LoRA weights loaded from: {lora_path}")
-    else:
-        logger.warning(
-            f"LoRA path not found at {lora_path}, "
-            "using base LLM without fine-tuning."
-        )
-
-    model = model.to(config.device)
+    model = model.move_graph_modules(config.device)
     model.eval()
     logger.info("Model ready for inference.")
     return model
@@ -107,7 +94,6 @@ class PUREInferencer:
         id2relation: Dict[int, str],
         config: PUREConfig,
         evaluator: PUREEvaluator,
-        feature_extractor: SimpleFeatureExtractor,
     ):
         self.model           = model
         self.kg              = kg
@@ -115,7 +101,6 @@ class PUREInferencer:
         self.id2relation     = id2relation
         self.config          = config
         self.evaluator       = evaluator
-        self.feature_extractor = feature_extractor
 
     @torch.no_grad()
     def generate_single(
@@ -129,9 +114,6 @@ class PUREInferencer:
         _sync_cuda()
         start_time = time.perf_counter()
 
-        sample          = {"target_item": target_item, "history": history}
-        candidate_paths = build_candidate_paths(sample, self.kg, self.config.max_hop)
-
         explanation = self.model.generate(
             target_item=target_item,
             history=history,
@@ -139,7 +121,6 @@ class PUREInferencer:
             adj=self.kg.adj,
             id2entity=self.id2entity,
             id2relation=self.id2relation,
-            candidate_paths=candidate_paths,
             max_new_tokens=max_new_tokens,
         )
 
@@ -152,14 +133,15 @@ class PUREInferencer:
         }
 
         if return_paths or return_subgraph:
-            selected_paths = self.model.path_retrieval.retrieve(
+            selected_paths, _ = self.model.path_retrieval.retrieve(
                 target_emb=self.model.node_embeddings[target_item],
                 history_embs=self.model.node_embeddings[history],
-                candidate_paths=candidate_paths,
+                target_item=target_item,
+                history=history,
+                path_index=self.model.path_index,
+                node_embeddings=self.model.node_embeddings,
                 node_degrees=self.kg.degree,
                 adj=self.kg.adj,
-                id2entity=self.id2entity,
-                id2relation=self.id2relation,
             )
             if return_paths:
                 result["selected_paths"] = self._format_paths(selected_paths)
@@ -215,10 +197,10 @@ class PUREInferencer:
     ) -> Dict[str, float]:
         generated_texts:        List[str]      = []
         reference_texts:        List[str]      = []
-        item_features_list:     List[Set[str]] = []
-        user_pos_features_list: List[Set[str]] = []
         latencies:              List[float]    = []
         all_results:            List[Dict]     = []
+        ranking_predictions:    List[List[int]] = []
+        ranking_targets:        List[int]       = []
 
         output_file = Path(output_path) if output_path else None
         if output_file:
@@ -233,6 +215,7 @@ class PUREInferencer:
                 ref_text       = batch["explanation_texts"][i]
                 item_feats     = set(batch["item_features"][i])
                 user_pos_feats = set(batch["user_pos_features"][i])
+                negative_items = batch["negative_items"][i]
                 history_texts  = [self.id2entity.get(h, str(h)) for h in history]
 
                 result     = self.generate_single(
@@ -246,12 +229,11 @@ class PUREInferencer:
 
                 generated_texts.append(gen_text)
                 reference_texts.append(ref_text)
-                item_features_list.append(item_feats)
-                user_pos_features_list.append(user_pos_feats)
                 latencies.append(latency_ms)
 
                 all_results.append({
                     "user_id":           batch["user_ids"][i],
+                    "target_item_id":    target_item,
                     "target_item":       self.id2entity.get(target_item, str(target_item)),
                     "history":           history_texts,
                     "reference":         ref_text,
@@ -261,6 +243,12 @@ class PUREInferencer:
                     "item_features":     list(item_feats),
                     "user_pos_features": list(user_pos_feats),
                 })
+                if negative_items:
+                    ranking_predictions.append(self.model.rank_candidates(
+                        history, [target_item, *negative_items],
+                        self.kg.degree, self.kg.adj,
+                    ))
+                    ranking_targets.append(target_item)
 
                 pbar.set_postfix({
                     "avg_lat": f"{np.mean(latencies):.0f}ms",
@@ -271,12 +259,10 @@ class PUREInferencer:
                     self._save_partial(all_results, output_file)
                     logger.info(f"Partial results saved ({len(all_results)} samples)")
 
-        logger.info("Computing explanation quality metrics via PUREEvaluator...")
-        explanation_metrics = self.evaluator.evaluate_explanations(
+        logger.info("Computing text quality metrics...")
+        explanation_metrics = self.evaluator.evaluate_text(
             predictions=generated_texts,
             references=reference_texts,
-            item_features=item_features_list,
-            user_pos_features=user_pos_features_list,
         )
 
         latency_stats = {
@@ -287,40 +273,16 @@ class PUREInferencer:
         }
 
         metrics: Dict[str, float] = {
-            "f_ehr":     round(explanation_metrics["F-EHR"],   4),
-            "p_ehr":     round(explanation_metrics["P-EHR"],   4),
             "bleu4":     round(explanation_metrics["BLEU-4"],  4),
             "rouge_l":   round(explanation_metrics["ROUGE-L"], 4),
-            "fmr":       round(explanation_metrics["FMR"],     4),
-            "fcr":       round(explanation_metrics["FCR"],     4),
             "div":       round(explanation_metrics["DIV"],     4),
             **latency_stats,
             "n_samples": len(generated_texts),
         }
-
-        gen_features_list = [self.feature_extractor.extract(t) for t in generated_texts]
-        p_ehr_calc        = self.evaluator.p_ehr_calculator
-
-        all_features: Set[str] = set()
-        for gf in gen_features_list:
-            all_features.update(gf)
-        for upf in user_pos_features_list:
-            all_features.update(upf)
-        feature_embs = p_ehr_calc.encode_features(list(all_features))
-
-        for idx, record in enumerate(all_results):
-            gen_feats        = gen_features_list[idx]
-            pos_feats        = user_pos_features_list[idx]
-            h_u              = p_ehr_calc.compute_user_intent_vector(pos_feats)
-            per_sample_p_ehr = compute_p_ehr(
-                generated_features=[gen_feats],
-                user_pos_features=[pos_feats],
-                feature_embeddings=feature_embs,
-                user_intent_vectors=[h_u],
-                tau=p_ehr_calc.tau,
-            )
-            record["p_ehr_score"]  = round(per_sample_p_ehr, 4)
-            record["gen_features"] = list(gen_feats)
+        if ranking_targets:
+            metrics.update(self.evaluator.evaluate_ranking(
+                ranking_predictions, ranking_targets,
+            ))
 
         if output_file:
             self._save_full(all_results, metrics, output_file)
@@ -489,17 +451,11 @@ class PUREInferencer:
         print(sep)
         print(f"  Samples evaluated  : {metrics['n_samples']}")
         print()
-        print("  [Faithfulness]")
-        print(f"    F-EHR  (↓)       : {metrics['f_ehr']:.4f}")
-        print(f"    P-EHR  (↓)       : {metrics['p_ehr']:.4f}")
-        print()
         print("  [Text Quality]")
         print(f"    BLEU-4  (↑)      : {metrics['bleu4']:.4f}")
         print(f"    ROUGE-L (↑)      : {metrics['rouge_l']:.4f}")
         print()
-        print("  [Explainability / Diversity]")
-        print(f"    FMR (↑)          : {metrics['fmr']:.4f}")
-        print(f"    FCR (↑)          : {metrics['fcr']:.4f}")
+        print("  [Diversity]")
         print(f"    DIV (↓)          : {metrics['div']:.4f}")
         print()
         print("  [Inference Efficiency]")
@@ -531,6 +487,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_k",         type=int, default=5)
     parser.add_argument("--device",         type=str, default="cuda")
     parser.add_argument("--seed",           type=int, default=42)
+    parser.add_argument("--path_score_threshold", type=float, default=0.0)
+    parser.add_argument("--candidate_pool", type=int, default=40)
+    parser.add_argument("--mmr_gamma", type=float, default=0.6)
     parser.add_argument("--profile_warmup", type=int, default=5)
     parser.add_argument("--profile_repeat", type=int, default=50)
     return parser.parse_args()
@@ -546,6 +505,9 @@ def main():
         batch_size=args.batch_size,
         device=args.device,
         seed=args.seed,
+        path_score_threshold=args.path_score_threshold,
+        candidate_pool=args.candidate_pool,
+        mmr_gamma=args.mmr_gamma,
     )
     logger.info(
         f"Mode: [{args.mode}] | Dataset: [{args.dataset}] | Device: [{args.device}]"
@@ -571,11 +533,13 @@ def main():
     logger.info("Fitting specificity scorer clusters...")
     specificity_scorer.fit_clusters(
         node_embeddings.cpu().numpy(),
-        all_node_ids=list(id2entity.keys()),
+        all_node_ids=list(range(kg.n_entities)),
         adj=kg.adj,
     )
 
-    path_encoder = PathEncoder(device=config.device)
+    path_index = build_or_load_path_index(
+        config, kg, data, node_embeddings, id2entity, id2relation,
+    )
 
     model = load_pure_model(
         config=config,
@@ -583,16 +547,10 @@ def main():
         kg=kg,
         node_embeddings=node_embeddings,
         specificity_scorer=specificity_scorer,
-        path_encoder=path_encoder,
+        path_index=path_index,
     )
 
-    entity_vocab     = set(id2entity.values())
-    pure_evaluator   = PUREEvaluator(
-        feature_vocab=entity_vocab,
-        tau=config.tau,
-        eval_k=args.eval_k,
-    )
-    simple_extractor = SimpleFeatureExtractor(feature_vocab=entity_vocab)
+    pure_evaluator = PUREEvaluator(eval_k=args.eval_k)
 
     inferencer = PUREInferencer(
         model=model,
@@ -601,7 +559,6 @@ def main():
         id2relation=id2relation,
         config=config,
         evaluator=pure_evaluator,
-        feature_extractor=simple_extractor,
     )
 
     if args.mode == "evaluate":
@@ -631,9 +588,8 @@ def main():
             eval_k=args.eval_k,
         )
         logger.info(
-            f"Done. F-EHR={metrics['f_ehr']:.4f} | "
-            f"P-EHR={metrics['p_ehr']:.4f} | "
-            f"BLEU-4={metrics['bleu4']:.4f}"
+            f"Done. BLEU-4={metrics['bleu4']:.4f} | "
+            f"ROUGE-L={metrics['rouge_l']:.4f}"
         )
 
     elif args.mode == "interactive":

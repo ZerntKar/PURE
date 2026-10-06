@@ -8,7 +8,7 @@ from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer
 
-from .feature_extractor import SimpleFeatureExtractor
+from .feature_extractor import normalize_text
 
 
 def compute_f_ehr(
@@ -18,6 +18,7 @@ def compute_f_ehr(
     rates = []
     for gen_feats, item_feats in zip(generated_features, item_features):
         if len(gen_feats) == 0:
+            rates.append(0.0)
             continue
         hallucinated = gen_feats - item_feats
         rates.append(len(hallucinated) / len(gen_feats))
@@ -29,15 +30,17 @@ def compute_p_ehr(
     user_pos_features: List[Set[str]],
     feature_embeddings: Dict[str, np.ndarray],
     user_intent_vectors: List[Optional[np.ndarray]],
-    tau: float = 0.40,
+    tau: float = 0.35,
 ) -> float:
     rates = []
     for gen_feats, pos_feats, h_u in zip(
         generated_features, user_pos_features, user_intent_vectors
     ):
         if len(gen_feats) == 0:
+            rates.append(0.0)
             continue
         if h_u is None:
+            # The semantic centroid is undefined without positive history.
             continue
         penalty_count = 0
         for f in gen_feats:
@@ -52,14 +55,16 @@ def compute_p_ehr(
                     continue
             penalty_count += 1
         rates.append(penalty_count / len(gen_feats))
-    return float(np.mean(rates)) if rates else 0.0
+    if not rates:
+        raise ValueError("P-EHR needs generated features with positive history evidence")
+    return float(np.mean(rates))
 
 
 class PreferenceEHRCalculator:
     def __init__(
         self,
         sent_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        tau: float = 0.40,
+        tau: float = 0.35,
     ):
         self.sent_model = SentenceTransformer(sent_model_name)
         self.tau = tau
@@ -130,7 +135,7 @@ def compute_bleu4(predictions: List[str], references: List[str]) -> float:
                 smoothing_function=smooth,
             )
         )
-    return float(np.mean(scores))
+    return float(np.mean(scores) * 100) if scores else 0.0
 
 
 def compute_rouge_l(predictions: List[str], references: List[str]) -> float:
@@ -146,13 +151,11 @@ def compute_fmr(
     generated_features: List[Set[str]],
     item_features: List[Set[str]],
 ) -> float:
-    rates = []
-    for gen_feats, item_feats in zip(generated_features, item_features):
-        if len(item_feats) == 0:
-            continue
-        matched = gen_feats & item_feats
-        rates.append(len(matched) / len(item_feats))
-    return float(np.mean(rates)) if rates else 0.0
+    """Fraction of explanations mentioning at least one supported item feature."""
+    return float(np.mean([
+        float(bool(gen_feats & item_feats))
+        for gen_feats, item_feats in zip(generated_features, item_features)
+    ])) if generated_features else 0.0
 
 
 def compute_fcr(
@@ -171,15 +174,23 @@ def compute_diversity(
     predictions: List[str],
     max_pairs: int = 1000,
 ) -> float:
-    if len(predictions) < 2:
+    n = len(predictions)
+    if n < 2:
         return 0.0
     smooth = SmoothingFunction().method1
-    all_pairs = [
-        (i, j)
-        for i in range(len(predictions))
-        for j in range(i + 1, len(predictions))
-    ]
-    sampled = random.sample(all_pairs, min(max_pairs, len(all_pairs)))
+    total_pairs = n * (n - 1) // 2
+    if total_pairs <= max_pairs:
+        sampled = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    else:
+        rng = random.Random(42)
+        sampled_set = set()
+        while len(sampled_set) < max_pairs:
+            i = rng.randrange(n)
+            j = rng.randrange(n - 1)
+            if j >= i:
+                j += 1
+            sampled_set.add((min(i, j), max(i, j)))
+        sampled = sorted(sampled_set)
     scores = []
     for i, j in sampled:
         tokens_i = predictions[i].split()
@@ -193,7 +204,7 @@ def compute_diversity(
                     smoothing_function=smooth,
                 )
             )
-    return float(np.mean(scores)) if scores else 0.0
+    return float(np.mean(scores) * 100) if scores else 0.0
 
 
 def compute_hr_at_k(
@@ -224,13 +235,23 @@ def compute_ndcg_at_k(
 class PUREEvaluator:
     def __init__(
         self,
-        feature_vocab: Set[str],
-        tau: float = 0.40,
+        tau: float = 0.35,
         eval_k: int = 5,
+        feature_extractor=None,
     ):
-        self.feature_extractor = SimpleFeatureExtractor(feature_vocab)
-        self.p_ehr_calculator = PreferenceEHRCalculator(tau=tau)
+        self.feature_extractor = feature_extractor
+        self.tau = tau
+        self.p_ehr_calculator = None
         self.eval_k = eval_k
+
+    def evaluate_text(
+        self, predictions: List[str], references: List[str],
+    ) -> Dict[str, float]:
+        return {
+            "BLEU-4": compute_bleu4(predictions, references),
+            "ROUGE-L": compute_rouge_l(predictions, references),
+            "DIV": compute_diversity(predictions),
+        }
 
     def evaluate_explanations(
         self,
@@ -238,16 +259,36 @@ class PUREEvaluator:
         references: List[str],
         item_features: List[Set[str]],
         user_pos_features: List[Set[str]],
+        generated_features: Optional[List[Set[str]]] = None,
     ) -> Dict[str, float]:
-        gen_features = [self.feature_extractor.extract(p) for p in predictions]
+        if generated_features is None and self.feature_extractor is None:
+            raise ValueError("A Sentires-Guide feature extractor is required")
+        if self.p_ehr_calculator is None:
+            self.p_ehr_calculator = PreferenceEHRCalculator(tau=self.tau)
+        gen_features = [
+            {normalize_text(f) for f in features}
+            for features in (
+                generated_features if generated_features is not None else
+                [self.feature_extractor.extract(p) for p in predictions]
+            )
+        ]
+        if not (
+            len(gen_features) == len(predictions) == len(references)
+            == len(item_features) == len(user_pos_features)
+        ):
+            raise ValueError("Prediction and feature lists must have equal lengths")
+        item_features = [
+            {normalize_text(f) for f in features} for features in item_features
+        ]
+        user_pos_features = [
+            {normalize_text(f) for f in features} for features in user_pos_features
+        ]
         return {
             "F-EHR":   compute_f_ehr(gen_features, item_features),
             "P-EHR":   self.p_ehr_calculator.compute(gen_features, user_pos_features),
-            "BLEU-4":  compute_bleu4(predictions, references),
-            "ROUGE-L": compute_rouge_l(predictions, references),
             "FMR":     compute_fmr(gen_features, item_features),
             "FCR":     compute_fcr(gen_features, item_features),
-            "DIV":     compute_diversity(predictions),
+            **self.evaluate_text(predictions, references),
         }
 
     def evaluate_ranking(

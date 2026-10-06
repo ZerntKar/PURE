@@ -18,7 +18,7 @@ class NodeSpecificityScorer(nn.Module):
         lambda_p: float = 0.42,
         alpha_struct: float = 1.0,
         eps: float = 1e-6,
-        n_clusters: int = 10,
+        n_clusters: int = 64,
     ):
         super().__init__()
         total = lambda_s + lambda_m + lambda_p
@@ -33,6 +33,7 @@ class NodeSpecificityScorer(nn.Module):
         self.n_clusters = n_clusters
 
         self.cluster_labels: Optional[np.ndarray] = None
+        self.label_by_id: Dict[int, int] = {}
         self.kmeans: Optional[KMeans] = None
         self._sem_cache: Dict[int, float] = {}
 
@@ -44,6 +45,9 @@ class NodeSpecificityScorer(nn.Module):
     ) -> None:
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
         self.cluster_labels = kmeans.fit_predict(node_embeddings)
+        if len(all_node_ids) != len(self.cluster_labels):
+            raise ValueError("One embedding is required for each node ID")
+        self.label_by_id = dict(zip(all_node_ids, self.cluster_labels.tolist()))
         self.kmeans = kmeans
         self._precompute_semantic_specificity(all_node_ids, adj)
 
@@ -68,9 +72,9 @@ class NodeSpecificityScorer(nn.Module):
                 scores.append(1.0)
                 continue
             neighbor_clusters = [
-                self.cluster_labels[n]
-                for n in neighbors
-                if n < len(self.cluster_labels)
+                self.label_by_id[neighbor if isinstance(neighbor, int) else neighbor[1]]
+                for neighbor in neighbors
+                if (neighbor if isinstance(neighbor, int) else neighbor[1]) in self.label_by_id
             ]
             if not neighbor_clusters:
                 scores.append(1.0)
@@ -137,6 +141,7 @@ class StructureEnhancedIndex:
         self.plm       = AutoModel.from_pretrained(plm_name)
         for p in self.plm.parameters():
             p.requires_grad = False
+        self.plm.eval()
 
         self.rgat = rgat_model
 
@@ -153,6 +158,7 @@ class StructureEnhancedIndex:
     def encode_entities(
         self, entity_texts: List[str], batch_size: int = 256
     ) -> torch.Tensor:
+        self.plm.eval()
         all_embeddings = []
         for i in range(0, len(entity_texts), batch_size):
             batch = entity_texts[i : i + batch_size]
@@ -166,14 +172,61 @@ class StructureEnhancedIndex:
             all_embeddings.append(emb.cpu())
         return torch.cat(all_embeddings, dim=0)
 
+    def fit_graph_encoder(
+        self,
+        x: torch.Tensor,
+        relation_embeddings: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor,
+        epochs: int,
+        learning_rate: float,
+    ) -> None:
+        """Learn the offline RGAT encoder from KG edges before indexing.
+
+        Relation-aware link reconstruction trains the graph encoder without
+        using explanation labels.
+        """
+        if epochs <= 0:
+            return
+        relation_decoder = nn.Embedding(relation_embeddings.size(0), self.rgat.layers[-1].heads * self.rgat.layers[-1].out_channels).to(self.device)
+        optimizer = torch.optim.AdamW(
+            list(self.rgat.parameters()) + list(relation_decoder.parameters()),
+            lr=learning_rate,
+        )
+        n_edges = edge_index.size(1)
+        for epoch in range(epochs):
+            self.rgat.train()
+            optimizer.zero_grad()
+            node_repr = self.rgat(x, edge_index, edge_type, relation_embeddings)
+            sampled = torch.randperm(n_edges, device=self.device)[: min(n_edges, 50_000)]
+            source = edge_index[0, sampled]
+            target = edge_index[1, sampled]
+            negative = torch.randint(x.size(0), target.shape, device=self.device)
+            relation = relation_decoder(edge_type[sampled])
+            positive_logits = ((node_repr[source] + relation) * node_repr[target]).sum(-1)
+            negative_logits = ((node_repr[source] + relation) * node_repr[negative]).sum(-1)
+            loss = F.softplus(-positive_logits).mean() + F.softplus(negative_logits).mean()
+            loss.backward()
+            optimizer.step()
+            print(f"RGAT index pretraining {epoch + 1}/{epochs}: loss={loss.item():.4f}")
+
     def build_index(
         self,
         entity_texts: List[str],
+        relation_texts: List[str],
         edge_index: torch.Tensor,
         edge_type: torch.Tensor,
+        pretrain_epochs: int = 0,
+        pretrain_lr: float = 1e-4,
     ) -> torch.Tensor:
         print("Encoding entities with PLM...")
         x = self.encode_entities(entity_texts).to(self.device)
+        relation_embeddings = self.encode_entities(relation_texts).to(self.device)
+
+        self.fit_graph_encoder(
+            x, relation_embeddings, edge_index.to(self.device), edge_type.to(self.device),
+            epochs=pretrain_epochs, learning_rate=pretrain_lr,
+        )
 
         print("Running RGAT for structural encoding...")
         training_state = self.rgat.training
@@ -184,12 +237,14 @@ class StructureEnhancedIndex:
                     x,
                     edge_index.to(self.device),
                     edge_type.to(self.device),
+                    relation_embeddings,
                 )
         finally:
             self.rgat.train(training_state)
 
         save_path = self.index_path / "node_embeddings.pt"
         torch.save(node_embs.cpu(), save_path)
+        torch.save(self.rgat.state_dict(), self.index_path / "rgat_encoder.pt")
         print(f"Index saved to {save_path}, shape: {node_embs.shape}")
         return node_embs
 

@@ -1,0 +1,12 @@
+torch>=2.1
+torch-geometric>=2.4
+transformers>=4.40
+peft>=0.10
+sentence-transformers>=2.7
+scikit-learn
+numpy
+nltk
+rouge-score
+tqdm
+accelerate
+bitsandbytes

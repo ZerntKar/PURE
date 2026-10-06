@@ -3,7 +3,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,9 +16,9 @@ from tqdm import tqdm
 from config import PUREConfig
 from data.dataset import KnowledgeGraph, RecommendationDataset, collate_fn
 from evaluation.metrics import PUREEvaluator
-from models.path_retrieval import PathEncoder
+from models.path_retrieval import PathEncoder, PathIndex
 from models.pure_model import PUREModel
-from models.rgat import RGATConv
+from models.rgat import RGATEncoder
 from models.semantic_index import NodeSpecificityScorer, StructureEnhancedIndex
 
 logging.basicConfig(
@@ -56,10 +56,11 @@ def load_data(config: PUREConfig) -> Dict:
 
     with open(data_dir / "entity_texts.json") as f:
         entity_texts: List[str] = json.load(f)
+    if len(entity_texts) != kg.n_entities:
+        raise ValueError("entity_texts.json must contain one text per entity ID")
     with open(data_dir / "id2entity.json") as f:
         id2entity: Dict[int, str] = {int(k): v for k, v in json.load(f).items()}
-    with open(data_dir / "id2relation.json") as f:
-        id2relation: Dict[int, str] = {int(k): v for k, v in json.load(f).items()}
+    id2relation: Dict[int, str] = kg.id2relation
 
     splits = {}
     for split in ["train", "valid", "test"]:
@@ -79,27 +80,16 @@ def load_data(config: PUREConfig) -> Dict:
     }
 
 
-def build_candidate_paths(
-    sample: Dict,
-    kg: KnowledgeGraph,
-    max_hop: int = 3,
-) -> List[List]:
-    target    = sample["target_item"]
-    history   = sample["history"]
-    all_paths = []
-    for hist_item in history:
-        paths = kg.multi_hop_paths(hist_item, target, max_hop=max_hop)
-        all_paths.extend(paths)
-    return all_paths
-
-
 def build_edge_tensors(
     kg: KnowledgeGraph,
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    src        = [t.head     for t in kg.triples]
-    dst        = [t.tail     for t in kg.triples]
-    rel        = [t.relation for t in kg.triples]
+    base_relations = kg.n_relations // 2
+    src = [t.head for t in kg.triples] + [t.tail for t in kg.triples]
+    dst = [t.tail for t in kg.triples] + [t.head for t in kg.triples]
+    rel = [t.relation for t in kg.triples] + [
+        t.relation + base_relations for t in kg.triples
+    ]
     edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
     edge_type  = torch.tensor(rel,        dtype=torch.long, device=device)
     return edge_index, edge_type
@@ -115,15 +105,19 @@ def build_or_load_index(
     index_path = Path(config.data_dir) / config.dataset / "index"
     emb_path   = index_path / "node_embeddings.pt"
 
-    if emb_path.exists():
-        logger.info(f"Loading precomputed index from {emb_path}")
-        return torch.load(emb_path, map_location=config.device, weights_only=True)
+    if emb_path.exists() and (index_path / "rgat_encoder.pt").exists():
+        cached = torch.load(emb_path, map_location=config.device, weights_only=True)
+        if tuple(cached.shape) == (kg.n_entities, config.rgat_hidden):
+            logger.info(f"Loading precomputed index from {emb_path}")
+            return cached
+        logger.info("Rebuilding node index after graph dimension or catalog change")
 
     logger.info("Building structure-enhanced semantic index (offline)...")
-    rgat = RGATConv(
-        in_channels=config.plm_hidden,
-        out_channels=config.rgat_out_channels,
+    rgat = RGATEncoder(
+        input_dim=config.plm_hidden,
+        hidden_dim=config.rgat_hidden,
         num_relations=kg.n_relations,
+        num_layers=config.rgat_layers,
         heads=config.rgat_heads,
     )
     index_builder = StructureEnhancedIndex(
@@ -132,8 +126,51 @@ def build_or_load_index(
         index_path=str(index_path),
     ).to(config.device)
 
-    node_embs = index_builder.build_index(entity_texts, edge_index, edge_type)
+    relation_texts = [
+        kg.id2relation[index] for index in range(kg.n_relations)
+    ]
+    node_embs = index_builder.build_index(
+        entity_texts, relation_texts, edge_index, edge_type,
+        pretrain_epochs=config.index_pretrain_epochs,
+        pretrain_lr=config.index_pretrain_lr,
+    )
     return node_embs.to(config.device)
+
+
+def build_or_load_path_index(config, kg, data, node_embeddings, id2entity, id2relation):
+    index_file = Path(config.data_dir) / config.dataset / "index" / "path_index.pt"
+    index = PathIndex(str(index_file))
+    samples = data["train"] + data["valid"] + data["test"]
+    expected_metadata = {
+        "version": 2,
+        "graph_dim": node_embeddings.shape[-1],
+        "path_plm_name": config.path_plm_name,
+        "max_hop": config.max_hop,
+        "max_paths_per_target": config.max_paths_per_target,
+        "max_neighbors": config.max_neighbors,
+        "indexed_targets": sorted({
+            int(candidate)
+            for sample in samples
+            for candidate in [sample["target_item"], *sample.get("negative_items", [])]
+        }),
+    }
+    if index_file.exists():
+        try:
+            index.load()
+            if index.metadata == expected_metadata:
+                return index
+            logger.info("Rebuilding path index after configuration or catalog change")
+        except (KeyError, ValueError, RuntimeError) as error:
+            logger.info(f"Rebuilding incompatible path index: {error}")
+    encoder = PathEncoder(config.path_plm_name).to(config.device)
+    index.build(
+        kg, samples, encoder, node_embeddings, id2entity, id2relation,
+        max_hop=config.max_hop,
+        max_paths_per_target=config.max_paths_per_target,
+        max_neighbors=config.max_neighbors,
+    )
+    del encoder
+    return index
 
 
 class Trainer:
@@ -171,13 +208,15 @@ class Trainer:
             weight_decay=0.01,
             betas=(0.9, 0.999),
         )
-        total_steps    = len(train_loader) // config.grad_accum * config.epochs
+        total_steps = (
+            (len(train_loader) + config.grad_accum - 1) // config.grad_accum
+        ) * config.epochs
         self.scheduler = CosineAnnealingLR(
             self.optimizer, T_max=total_steps, eta_min=1e-7
         )
         self.scaler = GradScaler()
 
-        self.best_p_ehr  = float("inf")
+        self.best_rouge_l = float("-inf")
         self.best_epoch  = 0
         self.global_step = 0
 
@@ -196,15 +235,6 @@ class Trainer:
         self.optimizer.zero_grad()
 
         for step, batch in enumerate(pbar):
-            candidate_paths_batch = [
-                build_candidate_paths(
-                    {"target_item": batch["target_items"][i], "history": batch["histories"][i]},
-                    self.kg,
-                    self.config.max_hop,
-                )
-                for i in range(len(batch["target_items"]))
-            ]
-
             with autocast():
                 outputs = self.model(
                     batch=batch,
@@ -212,9 +242,12 @@ class Trainer:
                     adj=self.kg.adj,
                     id2entity=self.id2entity,
                     id2relation=self.id2relation,
-                    candidate_paths_batch=candidate_paths_batch,
                 )
-                loss = outputs["loss"] / self.config.grad_accum
+                window_start = (step // self.config.grad_accum) * self.config.grad_accum
+                window_size = min(
+                    self.config.grad_accum, len(self.train_loader) - window_start,
+                )
+                loss = outputs["loss"] / window_size
 
             self.scaler.scale(loss).backward()
 
@@ -223,7 +256,7 @@ class Trainer:
             total_align_loss += outputs["loss_align"].item()
             n_batches        += 1
 
-            if (step + 1) % self.config.grad_accum == 0:
+            if (step + 1) % self.config.grad_accum == 0 or step + 1 == len(self.train_loader):
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
@@ -254,8 +287,6 @@ class Trainer:
 
         generated_texts:        List[str]      = []
         reference_texts:        List[str]      = []
-        item_features_list:     List[Set[str]] = []
-        user_pos_features_list: List[Set[str]] = []
 
         pbar = tqdm(loader, desc=f"Evaluating [{split}]", leave=False)
 
@@ -265,12 +296,6 @@ class Trainer:
                 history     = batch["histories"][i]
                 ref_text    = batch["explanation_texts"][i]
 
-                candidate_paths = build_candidate_paths(
-                    {"target_item": target_item, "history": history},
-                    self.kg,
-                    self.config.max_hop,
-                )
-
                 gen_text = self.model.generate(
                     target_item=target_item,
                     history=history,
@@ -278,19 +303,13 @@ class Trainer:
                     adj=self.kg.adj,
                     id2entity=self.id2entity,
                     id2relation=self.id2relation,
-                    candidate_paths=candidate_paths,
                 )
 
                 generated_texts.append(gen_text)
                 reference_texts.append(ref_text)
-                item_features_list.append(set(batch["item_features"][i]))
-                user_pos_features_list.append(set(batch["user_pos_features"][i]))
-
-        return self.evaluator.evaluate_explanations(
+        return self.evaluator.evaluate_text(
             predictions=generated_texts,
             references=reference_texts,
-            item_features=item_features_list,
-            user_pos_features=user_pos_features_list,
         )
 
     def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool = False):
@@ -300,9 +319,13 @@ class Trainer:
             "metrics":           metrics,
             "graph_transformer": self.model.graph_transformer.state_dict(),
             "projector":         self.model.projector.state_dict(),
+            "align_projector":   self.model.align_projector.state_dict(),
             "path_retrieval":    self.model.path_retrieval.state_dict(),
             "optimizer":         self.optimizer.state_dict(),
             "scheduler":         self.scheduler.state_dict(),
+            "scaler":            self.scaler.state_dict(),
+            "best_rouge_l":      self.best_rouge_l,
+            "best_epoch":        self.best_epoch,
         }
 
         lora_path = self.output_dir / f"lora_epoch{epoch+1}"
@@ -321,10 +344,15 @@ class Trainer:
         ckpt = torch.load(ckpt_path, map_location=self.config.device, weights_only=True)
         self.model.graph_transformer.load_state_dict(ckpt["graph_transformer"])
         self.model.projector.load_state_dict(ckpt["projector"])
+        self.model.align_projector.load_state_dict(ckpt["align_projector"])
         self.model.path_retrieval.load_state_dict(ckpt["path_retrieval"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
+        if "scaler" in ckpt:
+            self.scaler.load_state_dict(ckpt["scaler"])
         self.global_step = ckpt["global_step"]
+        self.best_rouge_l = ckpt.get("best_rouge_l", float("-inf"))
+        self.best_epoch = ckpt.get("best_epoch", 0)
         logger.info(
             f"Resumed from epoch {ckpt['epoch']+1}, "
             f"global_step {self.global_step}"
@@ -356,17 +384,14 @@ class Trainer:
                 logger.info(
                     f"Epoch {epoch+1}/{self.config.epochs} | "
                     f"Loss: {train_metrics['train_loss']:.4f} | "
-                    f"F-EHR: {valid_metrics['F-EHR']:.4f} | "
-                    f"P-EHR: {valid_metrics['P-EHR']:.4f} | "
                     f"BLEU-4: {valid_metrics['BLEU-4']:.4f} | "
                     f"ROUGE-L: {valid_metrics['ROUGE-L']:.4f} | "
-                    f"FMR: {valid_metrics['FMR']:.4f} | "
                     f"DIV: {valid_metrics['DIV']:.4f}"
                 )
 
-                is_best = valid_metrics["P-EHR"] < self.best_p_ehr
+                is_best = valid_metrics["ROUGE-L"] > self.best_rouge_l
                 if is_best:
-                    self.best_p_ehr = valid_metrics["P-EHR"]
+                    self.best_rouge_l = valid_metrics["ROUGE-L"]
                     self.best_epoch = epoch
 
                 self.save_checkpoint(epoch, combined, is_best=is_best)
@@ -374,10 +399,10 @@ class Trainer:
 
         logger.info(
             f"Training complete — "
-            f"Best P-EHR: {self.best_p_ehr:.4f} at epoch {self.best_epoch+1}"
+            f"Best ROUGE-L: {self.best_rouge_l:.4f} at epoch {self.best_epoch+1}"
         )
         return {
-            "best_p_ehr":  self.best_p_ehr,
+            "best_rouge_l": self.best_rouge_l,
             "best_epoch":  self.best_epoch,
             "all_metrics": all_metrics,
         }
@@ -390,10 +415,13 @@ def main():
     parser.add_argument("--data_dir",   type=str,   default="./data")
     parser.add_argument("--output_dir", type=str,   default="./checkpoints")
     parser.add_argument("--resume",     type=str,   default=None)
-    parser.add_argument("--epochs",     type=int,   default=20)
+    parser.add_argument("--epochs",     type=int,   default=10)
     parser.add_argument("--batch_size", type=int,   default=8)
     parser.add_argument("--lr",         type=float, default=1e-5)
     parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--path_score_threshold", type=float, default=0.0)
+    parser.add_argument("--candidate_pool", type=int, default=40)
+    parser.add_argument("--mmr_gamma", type=float, default=0.6)
     parser.add_argument("--device",     type=str,   default="cuda")
     args = parser.parse_args()
 
@@ -405,6 +433,9 @@ def main():
         lr=args.lr,
         seed=args.seed,
         device=args.device,
+        path_score_threshold=args.path_score_threshold,
+        candidate_pool=args.candidate_pool,
+        mmr_gamma=args.mmr_gamma,
     )
     set_seed(config.seed)
     logger.info(f"Config: {config}")
@@ -431,21 +462,14 @@ def main():
     logger.info("Fitting semantic clusters for specificity scoring...")
     specificity_scorer.fit_clusters(
         node_embeddings.cpu().numpy(),
-        all_node_ids=list(id2entity.keys()),
+        all_node_ids=list(range(kg.n_entities)),
         adj=kg.adj,
     )
 
-    path_encoder   = PathEncoder(device=config.device)
-    entity_vocab   = set(id2entity.values())
-    pure_evaluator = PUREEvaluator(
-        feature_vocab=entity_vocab,
-        tau=config.tau,
-        eval_k=config.eval_top_k,
+    path_index = build_or_load_path_index(
+        config, kg, data, node_embeddings, id2entity, id2relation,
     )
-    logger.info(
-        f"PUREEvaluator ready — "
-        f"vocab_size: {len(entity_vocab)}, tau: {config.tau}"
-    )
+    pure_evaluator = PUREEvaluator(eval_k=config.eval_top_k)
 
     from transformers import AutoTokenizer
     tokenizer           = AutoTokenizer.from_pretrained(config.llm_name)
@@ -477,8 +501,13 @@ def main():
         kg=kg,
         node_embeddings=node_embeddings,
         specificity_scorer=specificity_scorer,
-        path_encoder=path_encoder,
-    ).to(config.device)
+        path_index=path_index,
+        adapter_path=(
+            str(Path(args.resume).parent / f"lora_epoch{torch.load(args.resume, map_location='cpu', weights_only=True)['epoch'] + 1}")
+            if args.resume else None
+        ),
+        adapter_trainable=bool(args.resume),
+    ).move_graph_modules(config.device)
 
     trainer = Trainer(
         config=config,

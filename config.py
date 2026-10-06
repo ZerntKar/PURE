@@ -16,19 +16,25 @@ class PUREConfig:
 
     rgat_hidden:        int   = 1024
     rgat_heads:         int   = 4
-    rgat_layers:        int   = 3
-    rgat_out_channels:  int   = 256
+    rgat_layers:        int   = 4
+    rgat_out_channels:  int   = 1024
 
-    gt_hidden:          int   = 256
-    gt_heads:           int   = 2
-    gt_layers:          int   = 2
+    gt_hidden:          int   = 1024
+    gt_heads:           int   = 4
+    gt_layers:          int   = 4
     max_hop:            int   = 3
 
     top_n_paths:        int   = 5
     mmr_gamma:          float = 0.6
     candidate_pool:     int   = 40
+    path_score_threshold: float = 0.0
+    path_plm_name:      str   = "bert-large-uncased"
+    max_paths_per_target: int = 200
+    max_neighbors:      int   = 50
+    index_pretrain_epochs: int = 3
+    index_pretrain_lr: float = 1e-4
 
-    n_clusters:         int   = 10
+    n_clusters:         int   = 64
     alpha_struct:       float = 1.0
     eps_smooth:         float = 1e-6
     lambda_s:           float = 0.27
@@ -44,7 +50,7 @@ class PUREConfig:
 
     batch_size:         int   = 8
     grad_accum:         int   = 2
-    epochs:             int   = 20
+    epochs:             int   = 10
     lr:                 float = 1e-5
     lambda_align:       float = 0.1
     seed:               int   = 42
@@ -52,7 +58,7 @@ class PUREConfig:
         default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    tau:                float = 0.40
+    tau:                float = 0.35
     eval_top_k:         int   = 5
 
     def __post_init__(self):
@@ -68,8 +74,14 @@ class PUREConfig:
                 f"top_n_paths ({self.top_n_paths}) must be <= "
                 f"candidate_pool ({self.candidate_pool})"
             )
+        if self.rgat_hidden % self.rgat_heads or self.gt_hidden % self.gt_heads:
+            raise ValueError("Graph hidden dimensions must be divisible by their head counts")
         if self.rgat_out_channels != self.gt_hidden:
             raise ValueError(
                 f"rgat_out_channels ({self.rgat_out_channels}) must equal "
                 f"gt_hidden ({self.gt_hidden})"
             )
+        if not 0.0 <= self.mmr_gamma <= 1.0:
+            raise ValueError("mmr_gamma must be in [0, 1]")
+        if self.candidate_pool < 1 or self.top_n_paths < 1:
+            raise ValueError("candidate_pool and top_n_paths must be positive")
